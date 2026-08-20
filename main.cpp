@@ -1,17 +1,3 @@
-// apex_definer.cpp - Apex Legends .text code reconstructor
-//
-// Scans a PE dump for regions that IDA shows as raw "dq" data instead of code,
-// identifies function boundaries using prologue detection + instruction walking,
-// resolves RIP-relative string references, and outputs:
-//   ida_defines.py      - IDAPython script: undefine dq data, create functions, name them
-//   recovered_funcs.txt - human-readable disassembly with resolved strings annotated
-//
-// Build: cl /O2 /EHsc /std:c++17 apex_definer.cpp
-// Usage: apex_definer.exe dump.exe [-o outdir]
-//
-// The input can be a disk-layout dump OR a memory-aligned dump (same PE, different rawptr).
-// The tool is build-agnostic: no hardcoded addresses — everything is derived from the image.
-
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,9 +9,6 @@
 #include <fstream>
 #include <sstream>
 
-// ---------------------------------------------------------------------------
-// PE loader (minimal, matches the dumper)
-// ---------------------------------------------------------------------------
 struct Section { std::string name; uint32_t va, vsize, rawptr, rawsize; };
 class PeImage {
 public:
@@ -39,7 +22,7 @@ public:
     }
     bool load(const char* path) {
         FILE* f = fopen(path, "rb");
-        if (!f) { fprintf(stderr, "cannot open %s\n", path); return false; }
+        if (!f) { fprintf(stderr, "Couldn't open %s -- is the path right?\n", path); return false; }
         fseek(f, 0, SEEK_END); size_t n = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
         buf.resize(n); fread(buf.data(), 1, n, f); fclose(f);
         if (buf.size() < 0x40 || buf[0] != 'M' || buf[1] != 'Z') return false;
@@ -89,12 +72,11 @@ public:
             char c = (char)buf[o + i];
             if (!c) return s;
             unsigned char uc = (unsigned char)c;
-            if (uc < 0x20 || uc > 0x7E) return {}; // reject non-printable-ASCII
+            if (uc < 0x20 || uc > 0x7E) return {};
             s.push_back(c);
         }
         return {};
     }
-    // Read wide string at rva, convert to utf8
     std::string wcstr(uint32_t rva, size_t maxchars = 128) const {
         int64_t o = rva2off(rva); if (o < 0) return {};
         std::string s;
@@ -109,23 +91,18 @@ public:
     }
 };
 
-// ---------------------------------------------------------------------------
-// Instruction decoder (augmented from the dumper — handles more opcode families
-// and never returns 0 on unknown: falls back to a length-1 skip so the walker
-// never gets stuck).
-// ---------------------------------------------------------------------------
 struct InsnInfo {
-    int length;      // total byte length (>0), or 0 if truly undecipherable
-    bool isRet;      // C3 / CB / C2/CA (near/far ret)
-    bool isCall;     // E8 rel32 direct call
-    bool isJmp;      // E9 rel32 direct jmp
-    bool isCJmp;     // 70-7F / 0F 80-8F conditional
-    bool isRipRel;   // has a RIP-relative memory operand
-    int32_t ripDisp; // displacement of RIP-relative operand (if isRipRel)
-    int   ripOff;    // byte offset within insn where displacement starts (for RIP-relative)
-    int32_t relDisp; // displacement for CALL/JMP (if isCall/isJmp)
-    int   relOff;    // byte offset within insn where relDisp starts
-    bool isBad;      // set if we had to estimate length
+    int length;
+    bool isRet;
+    bool isCall;
+    bool isJmp;
+    bool isCJmp;
+    bool isRipRel;
+    int32_t ripDisp;
+    int   ripOff;
+    int32_t relDisp;
+    int   relOff;
+    bool isBad;
 };
 
 static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
@@ -133,7 +110,6 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
     if (avail == 0) { I.length = 1; I.isBad = true; return I; }
 
     size_t o = 0; int rex = 0; bool opsz = false, f3 = false, f2 = false, f0 = false;
-    // Prefixes
     for (;o < avail; o++) {
         uint8_t p = b[o];
         if (p == 0xF3) f3 = true;
@@ -149,11 +125,9 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
     uint8_t op = b[o++]; bool two = false; uint8_t op2 = 0;
     if (op == 0x0F) { if (o >= avail) { I.length=(int)o; I.isBad=true; return I; } two = true; op2 = b[o++]; }
 
-    // ModRM decoder helper
     auto skipModrm = [&](bool hasSib, bool hasDisp8, bool hasDisp32, bool hasImm8, bool hasImm32) -> bool {
         if (o >= avail) return false;
         uint8_t modrm = b[o++]; int mod = modrm >> 6, rm = modrm & 7;
-        // RIP-relative: mod==0, rm==5, no SIB
         if (!two && mod == 0 && rm == 5 && !hasSib) {
             if (o + 4 > avail) return false;
             int32_t disp; std::memcpy(&disp, b + o, 4);
@@ -180,16 +154,13 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
     bool ok = true;
     if (!two) {
         switch (op) {
-        // RET
         case 0xC3: I.isRet = true; break;
         case 0xCB: I.isRet = true; break;
         case 0xC2: case 0xCA: I.isRet = true; ok = noModrm(2); break;
-        // CALL rel32
         case 0xE8:
             if (o + 4 > avail) { ok = false; break; }
             std::memcpy(&I.relDisp, b + o, 4); I.relOff = (int)o;
             I.isCall = true; o += 4; break;
-        // JMP rel32 / rel8
         case 0xE9:
             if (o + 4 > avail) { ok = false; break; }
             std::memcpy(&I.relDisp, b + o, 4); I.relOff = (int)o;
@@ -198,19 +169,16 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
             if (o >= avail) { ok = false; break; }
             I.relDisp = (int8_t)b[o]; I.relOff = (int)o;
             I.isJmp = true; o++; break;
-        // Conditional jmps rel8
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
         case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
             if (o >= avail) { ok = false; break; }
             I.isCJmp = true; o++; break;
-        // MOV rm, r / r, rm / r, imm
         case 0x88: case 0x8A: ok = skipModrm(false,false,false,false,false); break;
         case 0x89: case 0x8B: ok = skipModrm(false,false,false,false,false); break;
-        case 0x8D: ok = skipModrm(false,false,false,false,false); break; // LEA
+        case 0x8D: ok = skipModrm(false,false,false,false,false); break;
         case 0xC7: ok = skipModrm(false,false,false,false,!opsz); break;
         case 0xC6: ok = skipModrm(false,false,false,true,false); break;
-        // Arithmetic rm, r/imm
         case 0x00: case 0x01: case 0x02: case 0x03:
         case 0x08: case 0x09: case 0x0A: case 0x0B:
         case 0x10: case 0x11: case 0x12: case 0x13:
@@ -224,72 +192,52 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
         case 0x80: ok = skipModrm(false,false,false,true,false); break;
         case 0x81: ok = skipModrm(false,false,false,false,!opsz); break;
         case 0x83: ok = skipModrm(false,false,false,true,false); break;
-        // INC/DEC/CALL/JMP/PUSH rm
         case 0xFF: case 0xFE: ok = skipModrm(false,false,false,false,false); break;
         case 0xF6: ok = skipModrm(false,false,false, (b[o-1]>>3&7)==0||((b[o-1]>>3)&7)==1, false); break;
         case 0xF7: ok = skipModrm(false,false,false,false, (b[o-1]>>3&7)==0||((b[o-1]>>3)&7)==1); break;
-        // PUSH/POP reg
         case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: break;
         case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F: break;
-        // PUSH imm
         case 0x68: ok = noModrm(opsz ? 2 : 4); break;
         case 0x6A: ok = noModrm(1); break;
-        // MOV reg, imm
         case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6: case 0xB7:
             ok = noModrm(1); break;
         case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD: case 0xBE: case 0xBF:
             ok = noModrm((rex & 8) ? 8 : (opsz ? 2 : 4)); break;
-        // NOP / misc single
         case 0x90: case 0x98: case 0x99: case 0xC9: case 0xCC: case 0xF4: break;
-        // XCHG
         case 0x63: ok = skipModrm(false,false,false,false,false); break;
-        // D0/D1/D2/D3
         case 0xD0: case 0xD1: case 0xD2: case 0xD3: ok = skipModrm(false,false,false,false,false); break;
         case 0xC1: ok = skipModrm(false,false,false,true,false); break;
-        // MOV, TEST with acc
         case 0xA0: case 0xA1: case 0xA2: case 0xA3: ok = noModrm((rex&8)?8:(opsz?2:4)); break;
         case 0xA4: case 0xA5: case 0xA6: case 0xA7: break;
         case 0xAA: case 0xAB: case 0xAC: case 0xAD: break;
         case 0xA8: ok = noModrm(1); break;
         case 0xA9: ok = noModrm(opsz?2:4); break;
-        // CMP/TEST imm acc
         case 0x3C: ok = noModrm(1); break;
         case 0x3D: ok = noModrm(opsz?2:4); break;
-        // IMUL reg, rm, imm
         case 0x69: ok = skipModrm(false,false,false,false,!opsz); break;
         case 0x6B: ok = skipModrm(false,false,false,true,false); break;
-        // MOVS/STOS/LODS/SCAS
         case 0xAE: case 0xAF: break;
-        // INT
         case 0xCD: ok = noModrm(1); break;
-        // ENTER
         case 0xC8: ok = noModrm(3); break;
-        // 8F POP rm
         case 0x8F: ok = skipModrm(false,false,false,false,false); break;
         default:
-            // Unknown: estimate 1 byte (safer than 0)
             I.isBad = true; break;
         }
     } else {
-        // Two-byte (0x0F xx)
         switch (op2) {
-        // Conditional jmps rel32
         case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
         case 0x86: case 0x87: case 0x88: case 0x89: case 0x8A: case 0x8B:
         case 0x8C: case 0x8D: case 0x8E: case 0x8F:
             if (o + 4 > avail) { ok = false; break; }
             I.isCJmp = true; o += 4; break;
-        // SETcc
         case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
         case 0x96: case 0x97: case 0x98: case 0x99: case 0x9A: case 0x9B:
         case 0x9C: case 0x9D: case 0x9E: case 0x9F:
             ok = skipModrm(false,false,false,false,false); break;
-        // CMOVcc
         case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45:
         case 0x46: case 0x47: case 0x48: case 0x49: case 0x4A: case 0x4B:
         case 0x4C: case 0x4D: case 0x4E: case 0x4F:
             ok = skipModrm(false,false,false,false,false); break;
-        // SSE moves
         case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
         case 0x16: case 0x17: case 0x28: case 0x29: case 0x2A: case 0x2B:
         case 0x2C: case 0x2D: case 0x2E: case 0x2F:
@@ -302,22 +250,16 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
         case 0x5B: case 0x53: case 0x64:
             ok = skipModrm(false,false,false,false,false); break;
         case 0xC6: ok = skipModrm(false,false,false,true,false); break;
-        // MOVDQA with imm8
-        // IMUL
-        // BSF/BSR/BSWAP
         case 0xBC: case 0xBD: ok = skipModrm(false,false,false,false,false); break;
         case 0xC8: case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE: case 0xCF:
-            break; // BSWAP rAX..rDI
-        // XADD
+            break;
         case 0xC0: case 0xC1: ok = skipModrm(false,false,false,false,false); break;
-        // MOVZX/MOVSX 8/16-bit
         case 0xB0: case 0xB1: ok = skipModrm(false,false,false,false,false); break;
-        // CMPXCHG
         case 0xA3: case 0xAB: case 0xBA: ok = skipModrm(false,false,false,false,false); break;
-        case 0x31: break; // RDTSC
-        case 0xA0: break; // PUSH FS
-        case 0xA8: break; // PUSH GS
-        case 0x05: break; // SYSCALL
+        case 0x31: break;
+        case 0xA0: break;
+        case 0xA8: break;
+        case 0x05: break;
         default:
             I.isBad = true; break;
         }
@@ -327,47 +269,32 @@ static InsnInfo decodeInsnFull(const uint8_t* b, size_t avail) {
     return I;
 }
 
-// ---------------------------------------------------------------------------
-// Function prologue detection
-// ---------------------------------------------------------------------------
 static bool isPrologue(const uint8_t* b, size_t avail) {
     if (avail < 2) return false;
-    // 48 89 5C / 6C / 74 / 7C 24 — MOV [RSP+N], RBX/RBP/RSI/RDI
     if (b[0] == 0x48 && b[1] == 0x89 && avail >= 4) {
         uint8_t r = b[2] & 0x38;
         if (b[3] == 0x24 && (r == 0x18 || r == 0x28 || r == 0x30 || r == 0x38)) return true;
     }
-    // 48 83 EC xx — SUB RSP, N
     if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC) return true;
-    // 40 53/55/56/57 — PUSH RBX/RBP/RSI/RDI
     if (b[0] == 0x40 && (b[1] == 0x53 || b[1] == 0x55 || b[1] == 0x56 || b[1] == 0x57)) return true;
-    // 41 54/55/56/57 — PUSH R12/R13/R14/R15
     if (b[0] == 0x41 && b[1] >= 0x54 && b[1] <= 0x57) return true;
-    // 48 8B C4 — MOV RAX, RSP (some prologues)
     if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0xC4) return true;
-    // 55 — PUSH RBP (classic)
     if (b[0] == 0x55 && avail >= 2 && (b[1] == 0x48 || b[1] == 0x57 || b[1] == 0x56)) return true;
-    // 53 — PUSH RBX
     if (b[0] == 0x53 && avail >= 2 && (b[1] == 0x48 || b[1] == 0x41 || b[1] == 0x56)) return true;
-    // 56/57 — PUSH RSI/RDI
     if ((b[0] == 0x56 || b[0] == 0x57) && avail >= 2 && (b[1] == 0x48 || b[1] == 0x41)) return true;
-    // 4C 89 xx 24 — MOV [RSP+N], R8-R15
     if (b[0] == 0x4C && b[1] == 0x89 && avail >= 4 && b[3] == 0x24) return true;
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Walk one function; return byte length and collect string refs
-// ---------------------------------------------------------------------------
 struct StringRef { uint32_t instrRva; uint32_t targetRva; std::string str; };
 
 struct FuncInfo {
     uint32_t startRva;
-    uint32_t size;      // 0 if not determined
-    std::vector<uint32_t> calls;     // call targets (RVA)
-    std::vector<StringRef> strRefs;  // resolved string references
-    int badInsns;                    // count of unrecognized bytes (quality metric)
-    bool complete;                   // ended with RET
+    uint32_t size;
+    std::vector<uint32_t> calls;
+    std::vector<StringRef> strRefs;
+    int badInsns;
+    bool complete;
 };
 
 static FuncInfo walkFunction(const PeImage& pe, const Section& text,
@@ -392,24 +319,19 @@ static FuncInfo walkFunction(const PeImage& pe, const Section& text,
 
         uint32_t instrRva = startRva + (uint32_t)o;
 
-        // Resolve RIP-relative references to .rdata strings
         if (ins.isRipRel && rdata) {
-            // target = instrRva + ins.length + ins.ripDisp
-            // (ripOff is offset inside instruction of the 4-byte displacement)
             uint32_t nextRva = instrRva + (uint32_t)ins.length;
             int64_t targetRaw = (int64_t)nextRva + ins.ripDisp;
             if (targetRaw >= rdata->va && targetRaw < (int64_t)(rdata->va + rdata->vsize)) {
                 uint32_t tgt = (uint32_t)targetRaw;
-                // Try as narrow string first
                 std::string s = pe.cstr(tgt, 128);
-                if (s.empty()) s = pe.wcstr(tgt, 64); // try wide
+                if (s.empty()) s = pe.wcstr(tgt, 64);
                 if (!s.empty()) {
                     fi.strRefs.push_back({ instrRva, tgt, s });
                 }
             }
         }
 
-        // Record CALL targets
         if (ins.isCall) {
             uint32_t nextRva = instrRva + (uint32_t)ins.length;
             uint32_t tgt = (uint32_t)((int64_t)nextRva + ins.relDisp);
@@ -419,12 +341,10 @@ static FuncInfo walkFunction(const PeImage& pe, const Section& text,
 
         if (ins.isRet) { o += (size_t)ins.length; fi.complete = true; break; }
 
-        // Far JMP out of the function region (likely a tail-call)
         if (ins.isJmp) {
             uint32_t nextRva = instrRva + (uint32_t)ins.length;
             int64_t dst = (int64_t)nextRva + ins.relDisp;
             o += (size_t)ins.length;
-            // If destination is far away, treat as end-of-function
             if (dst < (int64_t)startRva || dst > (int64_t)(startRva + maxSize)) {
                 fi.complete = true; break;
             }
@@ -432,30 +352,22 @@ static FuncInfo walkFunction(const PeImage& pe, const Section& text,
         }
 
         o += (size_t)ins.length;
-        // Excessive bad insns → bail (not really code)
         if (fi.badInsns > 20 && o < 64) { fi.size = (uint32_t)o; return fi; }
     }
     fi.size = (uint32_t)o;
     return fi;
 }
 
-// ---------------------------------------------------------------------------
-// Scan .text for function prologues that follow padding (CC CC or 0s)
-// ---------------------------------------------------------------------------
 static std::vector<uint32_t> findFunctionStarts(const PeImage& pe, const Section& text) {
     std::vector<uint32_t> starts;
     const uint8_t* tb = pe.buf.data() + text.rawptr;
     size_t n = std::min(text.rawsize, (uint32_t)(pe.buf.size() - text.rawptr));
 
     for (size_t i = 0; i < n; i++) {
-        // Look for padding sequences: 2+ CC (INT3) or 00 bytes
         if (i >= 2) {
             bool afterPad = false;
-            // CC CC padding
             if (tb[i - 1] == 0xCC && tb[i - 2] == 0xCC) afterPad = true;
-            // 0x90 NOP nop nop
             if (tb[i - 1] == 0x90 && tb[i - 2] == 0x90) afterPad = true;
-            // After a C3 (RET) at a 16-byte-aligned spot
             if (tb[i - 1] == 0xCC) afterPad = true;
             if (tb[i - 1] == 0x00 && tb[i - 2] == 0x00) afterPad = true;
 
@@ -463,23 +375,17 @@ static std::vector<uint32_t> findFunctionStarts(const PeImage& pe, const Section
                 starts.push_back(text.va + (uint32_t)i);
             }
         }
-        // Also catch 16-byte aligned prologues even without obvious padding
         if ((i & 0xF) == 0 && isPrologue(tb + i, n - i)) {
-            // Verify it's not already been seen
             uint32_t rva = text.va + (uint32_t)i;
             if (starts.empty() || starts.back() != rva)
                 starts.push_back(rva);
         }
     }
-    // Dedup and sort
     std::sort(starts.begin(), starts.end());
     starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
     return starts;
 }
 
-// ---------------------------------------------------------------------------
-// Known function RVAs to relabel (from the analysis sessions)
-// ---------------------------------------------------------------------------
 struct KnownFunc { uint32_t rva; const char* name; const char* desc; };
 static const KnownFunc kKnownFuncs[] = {
     {0x002ED2FA, "Legend__CL_Frame",                        "per-frame client update, signon state machine"},
@@ -494,9 +400,6 @@ static const KnownFunc kKnownFuncs[] = {
     {0x00B3C4F0, "Legend__ScriptVM_RegisterClientGlobals",  "bulk-register natives/constants into client VM"},
 };
 
-// ---------------------------------------------------------------------------
-// Disassembly text formatter (very simple — bytes in hex + annotation)
-// ---------------------------------------------------------------------------
 static std::string formatBytes(const uint8_t* b, int len) {
     std::string s;
     for (int i = 0; i < len && i < 10; i++) {
@@ -506,16 +409,13 @@ static std::string formatBytes(const uint8_t* b, int len) {
     return s;
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     if (argc < 2) {
         printf("Apex Legends .text function reconstructor\n");
         printf("usage: %s <dump.exe> [-o outdir]\n\n", argv[0]);
-        printf("outputs:\n");
-        printf("  ida_defines.py       IDAPython script: undefine dq data, create functions, name them\n");
-        printf("  recovered_funcs.txt  human-readable disassembly with resolved strings\n");
+        printf("It writes out two files:\n");
+        printf("  ida_defines.py       IDAPython script -- undefines the dq blobs, makes functions, names them\n");
+        printf("  recovered_funcs.txt  a readable disassembly dump with the strings it found\n");
         return 1;
     }
     const char* inpath = argv[1];
@@ -524,21 +424,19 @@ int main(int argc, char** argv) {
 
     PeImage pe;
     if (!pe.load(inpath)) return 2;
-    printf("[+] loaded %s  base=0x%llX  size=0x%X  sections=%zu\n",
+    printf("Loaded %s  (base 0x%llX, %u bytes, %zu sections)\n",
         inpath, (unsigned long long)pe.imageBase, pe.sizeOfImage, pe.secs.size());
 
     const Section* text = nullptr;
     for (auto& s : pe.secs) if (s.name == ".text") { text = &s; break; }
-    if (!text) { fprintf(stderr, "[-] no .text section\n"); return 3; }
-    printf("[+] .text at RVA 0x%X  rawptr=0x%X  size=0x%X\n", text->va, text->rawptr, text->rawsize);
+    if (!text) { fprintf(stderr, "No .text section in there -- can't do anything without it.\n"); return 3; }
+    printf("Found .text at RVA 0x%X  (file offset 0x%X, 0x%X bytes)\n", text->va, text->rawptr, text->rawsize);
 
-    // ---- Find candidate function starts ----
-    printf("[*] scanning .text for function prologues (this takes a few seconds)...\n");
+    printf("Scanning .text for function prologues -- give it a few seconds...\n");
     fflush(stdout);
     std::vector<uint32_t> starts = findFunctionStarts(pe, *text);
-    printf("[+] found %zu candidate function starts\n", starts.size());
+    printf("Got %zu candidate starts.\n", starts.size());
 
-    // ---- Merge with known functions (ensure they're always included) ----
     for (auto& kf : kKnownFuncs) {
         bool found = std::binary_search(starts.begin(), starts.end(), kf.rva);
         if (!found) starts.push_back(kf.rva);
@@ -546,49 +444,33 @@ int main(int argc, char** argv) {
     std::sort(starts.begin(), starts.end());
     starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
 
-    // ---- Walk each candidate ----
-    printf("[*] walking %zu function candidates...\n", starts.size());
+    printf("Walking all %zu of them now...\n", starts.size());
     std::vector<FuncInfo> funcs;
     funcs.reserve(starts.size());
     size_t complete_count = 0;
     for (uint32_t rva : starts) {
         FuncInfo fi = walkFunction(pe, *text, rva);
-        // Filter: must have at least 4 bytes and not be all-bad
         if (fi.size < 4) continue;
-        if (fi.badInsns > (int)(fi.size / 2)) continue; // >50% bad → skip
+        if (fi.badInsns > (int)(fi.size / 2)) continue;
         funcs.push_back(fi);
         if (fi.complete) complete_count++;
     }
-    printf("[+] %zu functions accepted (%zu complete / ended with RET)\n", funcs.size(), complete_count);
+    printf("Kept %zu of them, %zu ran clean to a RET.\n", funcs.size(), complete_count);
 
-    // Build name lookup for known functions
     std::map<uint32_t, std::pair<std::string, std::string>> knownMap;
     for (auto& kf : kKnownFuncs) knownMap[kf.rva] = { kf.name, kf.desc };
 
-    // ---- Count string references across all functions ----
     size_t totalStrRefs = 0;
     for (auto& fi : funcs) totalStrRefs += fi.strRefs.size();
-    printf("[+] %zu string references resolved across all functions\n", totalStrRefs);
+    printf("Resolved %zu string references along the way.\n", totalStrRefs);
 
-    // -----------------------------------------------------------------------
-    // Output 1: IDAPython script
-    // -----------------------------------------------------------------------
     std::string pypath = outdir + "/ida_defines.py";
     {
         std::ofstream o(pypath);
-        o << "# Auto-generated by apex_definer\n";
-        o << "# Run in IDA Pro: File -> Script file -> ida_defines.py\n";
-        o << "# This script:\n";
-        o << "#   1) Undefines collapsed dq regions in .text\n";
-        o << "#   2) Creates functions at identified starts\n";
-        o << "#   3) Names known reversed functions\n";
-        o << "#   4) Adds comments for resolved string references\n\n";
         o << "import idc, idaapi, ida_funcs, ida_bytes, ida_auto, ida_name\n\n";
         o << "IMAGE_BASE = 0x" << std::hex << pe.imageBase << std::dec << "\n";
         o << "def ea(rva): return IMAGE_BASE + rva\n\n";
 
-        // Step 1: undefine all candidate regions
-        o << "# Step 1: undefine collapsed regions\n";
         o << "def undefine_region(start_rva, size):\n";
         o << "    a = ea(start_rva)\n";
         o << "    ida_bytes.del_items(a, ida_bytes.DELIT_SIMPLE, max(size, 16))\n\n";
@@ -598,17 +480,14 @@ int main(int argc, char** argv) {
         o << "]\n";
         o << "for rva, sz in regions:\n";
         o << "    undefine_region(rva, sz)\n";
-        o << "print(f'[+] Undefined {len(regions)} regions')\n\n";
+        o << "print(f'Cleared {len(regions)} regions.')\n\n";
 
-        // Step 2: create functions
-        o << "# Step 2: create functions\n";
         o << "created = 0; failed = 0\n";
         o << "for rva, sz in regions:\n";
         o << "    a = ea(rva)\n";
         o << "    if ida_funcs.add_func(a):\n";
         o << "        created += 1\n";
         o << "    else:\n";
-        o << "        # Try defining individual instructions then retry\n";
         o << "        cur = a\n";
         o << "        for _ in range(min(sz, 512)):\n";
         o << "            l = idc.create_insn(cur)\n";
@@ -616,10 +495,8 @@ int main(int argc, char** argv) {
         o << "            cur += l\n";
         o << "        if ida_funcs.add_func(a): created += 1\n";
         o << "        else: failed += 1\n";
-        o << "print(f'[+] Created {created} functions, {failed} failed')\n\n";
+        o << "print(f'Made {created} functions ({failed} wouldn\\'t take).')\n\n";
 
-        // Step 3: name known functions
-        o << "# Step 3: name known reversed functions\n";
         o << "names = [\n";
         for (auto& kf : kKnownFuncs)
             o << "    (0x" << std::hex << kf.rva << std::dec
@@ -629,16 +506,13 @@ int main(int argc, char** argv) {
         o << "    a = ea(rva)\n";
         o << "    idc.set_name(a, name, idc.SN_CHECK | idc.SN_NOCHECK)\n";
         o << "    idc.set_func_cmt(a, desc, 0)\n";
-        o << "print(f'[+] Named {len(names)} known functions')\n\n";
+        o << "print(f'Renamed the {len(names)} functions we already know.')\n\n";
 
-        // Step 4: comments for string refs
-        o << "# Step 4: add string-reference comments\n";
         o << "import re\n";
         o << "str_refs = [\n";
         size_t refCount = 0;
         for (auto& fi : funcs) {
             for (auto& sr : fi.strRefs) {
-                // Escape the string for Python
                 std::string esc;
                 for (char c : sr.str) {
                     unsigned char uc = (unsigned char)c;
@@ -646,7 +520,7 @@ int main(int argc, char** argv) {
                     else if (c == '\\')  esc += "\\\\";
                     else if (c == '\n')  esc += "\\n";
                     else if (c == '\t')  esc += "\\t";
-                    else if (uc < 0x20 || uc > 0x7E) {   // escape ALL non-printable-ASCII
+                    else if (uc < 0x20 || uc > 0x7E) {
                         char tmp[8]; snprintf(tmp, sizeof tmp, "\\x%02x", uc); esc += tmp;
                     }
                     else esc.push_back(c);
@@ -655,25 +529,20 @@ int main(int argc, char** argv) {
                 o << "    (0x" << std::hex << sr.instrRva << ", 0x" << sr.targetRva << std::dec
                   << ", '" << esc << "'),\n";
                 refCount++;
-                if (refCount > 50000) { o << "    # ... truncated ...\n"; goto done_refs; }
+                if (refCount > 50000) { o << "    # (cut off here -- too many to list)\n"; goto done_refs; }
             }
         }
         done_refs:
         o << "]\n";
         o << "for rva, tgt_rva, s in str_refs:\n";
         o << "    idc.set_cmt(ea(rva), f'-> \"{s}\"  [RVA 0x{tgt_rva:X}]', 0)\n";
-        o << "print(f'[+] Added {len(str_refs)} string-reference comments')\n\n";
+        o << "print(f'Dropped {len(str_refs)} string comments in.')\n\n";
 
-        // Step 5: wait for auto-analysis
-        o << "# Step 5: trigger auto-analysis pass on new code\n";
         o << "ida_auto.auto_wait()\n";
-        o << "print('[+] apex_definer: all done')\n";
+        o << "print('All done -- go check the .text window.')\n";
     }
-    printf("[+] wrote %s\n", pypath.c_str());
+    printf("Wrote %s\n", pypath.c_str());
 
-    // -----------------------------------------------------------------------
-    // Output 2: human-readable function listing with resolved strings
-    // -----------------------------------------------------------------------
     std::string txtpath = outdir + "/recovered_funcs.txt";
     {
         std::ofstream o(txtpath);
@@ -695,7 +564,6 @@ int main(int argc, char** argv) {
                     fi.startRva, fi.startRva, fi.size, fi.complete?"[RET]":"[?]");
             o << hdr;
 
-            // Walk the function again to output a minimal disassembly
             int64_t textOff = pe.rva2off(fi.startRva);
             if (textOff >= 0) {
                 const uint8_t* base = pe.buf.data() + textOff;
@@ -709,7 +577,6 @@ int main(int argc, char** argv) {
                     snprintf(line, sizeof line, "  0x%08X  %s",
                         instrRva, formatBytes(base + off, ins.length).c_str());
                     o << line;
-                    // Annotate string references at this instruction
                     for (auto& sr : fi.strRefs) {
                         if (sr.instrRva == instrRva) {
                             std::string trunc = sr.str;
@@ -717,7 +584,6 @@ int main(int argc, char** argv) {
                             o << "  ; -> \"" << trunc << "\"";
                         }
                     }
-                    // Annotate CALL targets
                     if (ins.isCall) {
                         uint32_t tgt = (uint32_t)((int64_t)(instrRva + ins.length) + ins.relDisp);
                         auto tkit = knownMap.find(tgt);
@@ -734,7 +600,6 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Summary: unique strings found in this function
             if (!fi.strRefs.empty()) {
                 o << "  -- strings referenced --\n";
                 std::set<std::string> seen;
@@ -750,9 +615,8 @@ int main(int argc, char** argv) {
             o << "\n";
         }
 
-        // Global string reference index
         o << "\n==========================================================================\n";
-        o << "STRING REFERENCE INDEX (all strings found, sorted alphabetically)\n";
+        o << "STRING REFERENCE INDEX\n";
         o << "==========================================================================\n\n";
         std::map<std::string, std::vector<uint32_t>> strIndex;
         for (auto& fi : funcs)
@@ -770,7 +634,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    printf("[+] wrote %s\n", txtpath.c_str());
-    printf("[+] done. run ida_defines.py inside IDA to define all functions and add string comments.\n");
+    printf("Wrote %s\n", txtpath.c_str());
+    printf("Done. Load ida_defines.py in IDA and it'll define everything and drop the string comments in.\n");
     return 0;
 }

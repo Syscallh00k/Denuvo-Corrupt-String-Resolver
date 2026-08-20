@@ -1,0 +1,1 @@
+ This tool takes a dumped executable and reconstruct as many functions, strings, class & vtable as it can then output a new executable as well as an ida python script that you can link to resolve everything on your scylla dump.

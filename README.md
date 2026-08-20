@@ -2,4 +2,8 @@ I created this tool to fix dumps for apex legend, as Denuvo breaks / corrupts a 
 
 Note: This tool was built of the version of Denuvo Apex Legends uses
 
+usage:
+```
+Denuvo_reBuilder.exe C:\\Path_To_Dump -o  C:\\Path_To_Output
+```
 Output: New PE File & IDA Python Script
